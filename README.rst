@@ -1,9 +1,16 @@
-Template for the Read the Docs tutorial
-=======================================
+Rho Prediction Model Documentation
+==================================
 
-This GitHub template includes fictional Python library
-with some basic Sphinx docs.
+This repository contains Read the Docs documentation for a probabilistic
+``rho`` prediction model based on ``tau`` and ``rewards`` vehicle-road features.
 
-Read the tutorial here:
+The Sphinx source files live in ``docs/source``. The documentation is organized
+around task definition, data preparation, architecture, training, evaluation,
+and implementation recommendations.
 
-https://docs.readthedocs.io/en/stable/tutorial/
+Build locally with:
+
+.. code-block:: console
+
+   cd docs
+   make html

@@ -1,0 +1,309 @@
+模型设计：输入 tau 和 rewards，预测 rho
+
+1. 任务定义
+
+目标是设计一个从 tau 和奖励矩阵 rewards 中预测 rho 的模型。以 SUMO 环境为例，tau 不是时间序列，而是“车辆-道路”结构特征：每辆车在出现时，对每条道路记录距离终点的距离和该道路的排队长度。rho 不应只被看作一个确定性回归标签，而应被看作条件分布 p(rho | tau, rewards) 的统计量或后验预测结果。因此模型输出的不只是一个点估计 rho_hat，还应输出预测不确定性，例如均值 mu 和尺度 sigma，必要时也可以输出混合分布参数。
+
+输入：
+- tau: shape 通常为 [N_vehicle, N_road, D_tau]，例如 [1557, 114, 2]。以 SUMO 环境为例，1557 表示车辆数，114 表示道路数，2 个特征为 [距离终点的距离, 该道路的排队长度]。
+- rewards: shape 通常为 [N_vehicle, N_road]，例如 [1557, 114]，表示每辆车对每条道路各自的奖励。
+
+输出：
+- rho 的后验预测分布参数。
+- 默认输出为 Gaussian 或 Student-t 分布参数：mu, sigma。
+- 最终预测值可取后验均值 E[rho | tau, rewards] = mu，也可以在需要稳健性时取后验中位数。
+
+
+2. 数据集划分
+
+为了验证泛化性，不能只做随机打乱划分，还应避免相似个体或同一生成过程泄漏到训练集和测试集。
+
+推荐划分方式：
+
+训练集：
+- 70% 个体或场景。
+- 用于模型参数学习。
+
+验证集：
+- 15% 个体或场景。
+- 用于调参、早停、选择模型结构。
+
+测试集：
+- 15% 个体或场景。
+- 完全不参与训练和调参，只用于最终报告泛化性能。
+
+更严格的泛化评估：
+- 如果数据来自不同 round、candidate、agent 数量、seed 或仿真配置，应按 group 划分。
+- 例如按 round 或 source 分组，确保某些 round/source 只出现在测试集中。
+- 这样测试集更接近“没见过的验证集”，能检验模型是否真的学到 tau/rewards 到 rho 的可迁移关系，而不是记住训练分布中的局部模式。
+
+预处理：
+- 对 tau 中的非有限值进行 mask，并添加 valid_mask 作为额外输入。
+- tau 按特征维做标准化，rewards 可做 robust scaling，例如减中位数、除以 IQR。
+- rho 可做 logit 或 z-score 变换。如果 rho 始终为正且范围较小，可预测 log(rho + eps) 的分布，最后再反变换。
+- 保留每个样本的统计特征，例如 reward mean、reward std、reward quantile、距离终点距离的分布统计、排队长度的分布统计、每辆车可选道路的 reward 排名统计等，作为辅助全局特征。
+
+
+3. 网络架构
+
+整体采用“道路编码器 + 车辆集合聚合 + 全局统计分支 + 贝叶斯预测头”的结构。
+
+输入张量：
+- tau: [B, N_vehicle, N_road, D_tau]
+- rewards: [B, N_vehicle, N_road]
+- mask: [B, N_vehicle, N_road]，标记有效位置
+
+其中 B 是 batch size，N_vehicle 是车辆数量，N_road 是道路数量。114 表示道路维度，不表示时间维度。
+
+3.1 车辆-道路局部编码
+
+对每辆车 i 和每条道路 j，构造局部特征：
+
+x_i,j = concat(
+    tau_i,j,
+    rewards_i,j,
+    road_id_embedding_j,
+    valid_mask_i,j
+)
+
+其中 tau_i,j 包含 [距离终点的距离, 该道路的排队长度]。road_id_embedding_j 是道路 ID 嵌入；如果有道路拓扑信息，也可以替换为 road topology embedding。
+
+局部编码器推荐采用 Road Transformer Encoder 或 Road Graph Encoder：
+
+推荐结构 A：Road Transformer Encoder
+- Linear projection: input_dim -> hidden_dim
+- Road ID embedding: learnable
+- Transformer Encoder x 3-4 层
+- hidden_dim = 128 或 256
+- attention heads = 4 或 8
+- dropout = 0.1
+- feedforward_dim = 4 * hidden_dim
+
+每辆车的 114 条道路经过 road encoder 后，通过 masked attention pooling 得到车辆级表示 h_i：
+
+h_i = AttentionPool({z_i,j}_{j=1..N_road}, mask_i)
+
+推荐结构 B：Road Graph Encoder
+- 如果已知道 114 条道路之间的连接关系，使用 GNN/GAT 编码道路拓扑。
+- 节点为道路，节点特征为该车在该道路上的 tau/reward 特征。
+- GAT layers x 2-3 层，hidden_dim = 128。
+- 最后对道路节点做 attention pooling，得到车辆级表示 h_i。
+
+如果暂时没有道路拓扑，Road Transformer 更合适，因为它能学习不同道路之间的相互影响；如果有 SUMO 路网图，Road Graph Encoder 更有归纳偏置，通常泛化性更强。
+
+3.2 集合级聚合
+
+tau 和 rewards 中 N_vehicle 个车辆之间没有固定强语义顺序，因此需要 permutation-invariant 或 permutation-equivariant 聚合。
+
+推荐使用 Set Transformer：
+- 输入：{h_i}_{i=1..N}
+- Induced Set Attention Blocks x 2
+- num_inducing_points = 16 或 32
+- hidden_dim = 128 或 256
+- Multihead attention heads = 4
+- Pooling by Multihead Attention，得到全局表示 h_global
+
+可选轻量版本：
+- DeepSets: h_global = MLP(mean_i phi(h_i), max_i phi(h_i), std_i phi(h_i))
+- 当数据量较小时，DeepSets 更不容易过拟合。
+
+3.3 全局统计特征分支
+
+并行构造统计特征 s：
+- rewards: mean, std, min, max, median, quantiles, positive ratio, saturation ratio
+- tau distance-to-destination: mean, std, min, max, quantiles, zero ratio, valid ratio
+- tau queue length: mean, std, min, max, quantiles, congestion ratio, valid ratio
+- per-vehicle best-road reward, top-k reward mean, reward gap between top-1 and top-2
+- mask: missing ratio, nonfinite repaired ratio
+
+统计特征经过 MLP：
+- Linear -> LayerNorm -> GELU -> Dropout
+- Linear -> GELU
+- 输出 h_stats
+
+最终表示：
+
+h = concat(h_global, h_stats)
+
+再经过融合层：
+- MLP: hidden_dim*2 -> 256 -> 128
+- activation: GELU
+- normalization: LayerNorm
+- dropout: 0.1
+
+3.4 贝叶斯预测头
+
+基础版本：Student-t likelihood head
+
+输出：
+- mu = Linear(h, 1)
+- log_sigma = Linear(h, 1)
+- log_nu = Linear(h, 1)
+
+约束：
+- sigma = softplus(log_sigma) + 1e-6
+- nu = softplus(log_nu) + 2.0
+
+预测分布：
+
+rho | tau, rewards ~ StudentT(nu, mu, sigma)
+
+选择 Student-t 的原因：
+- 对异常 rho 或高噪声样本更稳健。
+- 比 Gaussian NLL 对离群点不那么敏感。
+- 更符合贝叶斯后验预测中存在尾部不确定性的情况。
+
+增强版本：Mixture Density Network
+
+如果 rho 的后验可能多峰，可输出 K 个 Student-t 或 Gaussian mixture：
+- mixture logits pi_k
+- mu_k
+- sigma_k
+- nu_k
+
+预测分布：
+
+p(rho | tau, rewards) = sum_k pi_k StudentT(rho; nu_k, mu_k, sigma_k)
+
+K 可取 3 或 5。数据量较小时先用 K=1，避免过拟合。
+
+
+4. 损失函数：不用 MSE
+
+由于任务本质是贝叶斯推断，训练目标应最大化条件后验预测概率，而不是最小化点估计误差。
+
+主损失：负对数似然 NLL
+
+对于 Student-t 输出：
+
+L_nll = - log p(rho_true | tau, rewards)
+
+如果使用混合分布：
+
+L_nll = - log sum_k pi_k p_k(rho_true | tau, rewards)
+
+该损失直接优化模型对真实 rho 的概率分配，能同时学习预测值和不确定性。
+
+辅助损失 1：CRPS
+
+CRPS 用于评估概率预测分布与真实观测之间的距离，比 MSE 更适合概率预测。可作为验证指标或辅助训练项：
+
+L = L_nll + lambda_crps * L_crps
+
+辅助损失 2：KL 正则或权重先验
+
+如果采用 Bayesian Neural Network 或 MC Dropout，可以对权重分布加入 KL 正则：
+
+L = E_q[-log p(rho | tau, rewards, w)] + beta * KL(q(w) || p(w))
+
+这相当于变分推断的 ELBO 目标，符合贝叶斯推断设定。
+
+辅助损失 3：排序一致性损失
+
+如果 rho 的相对大小很重要，可加入 pairwise ranking loss：
+
+L_rank = -log sigmoid((rho_i - rho_j) * (mu_i - mu_j))
+
+总损失：
+
+L_total = L_nll + beta * L_kl + lambda_rank * L_rank
+
+默认推荐：
+- 首选 Student-t NLL。
+- 数据量足够且后验多峰时用 mixture NLL。
+- 用 MC Dropout 或 Deep Ensemble 估计 epistemic uncertainty。
+
+
+5. 提高泛化性的设计
+
+5.1 结构上的泛化
+
+使用 road encoder 捕捉同一车辆在不同道路上的距离、排队长度和奖励关系，而不是只依赖简单 flatten。
+
+使用 Set Transformer 或 DeepSets 处理 N 维集合，减少模型对个体排列的依赖，从而提升跨样本、跨 agent 数量或跨场景的泛化性。
+
+加入统计特征分支，让模型同时获得低阶稳定统计量和深层动态表示。深层网络负责复杂模式，统计分支负责稳健基线。
+
+5.2 训练上的泛化
+
+数据增强：
+- 对 agent 维度随机 permutation。
+- 对 tau 添加小幅高斯噪声。
+- 对 rewards 做轻微缩放或扰动。
+- 随机 mask 部分车辆-道路项，提升缺失数据鲁棒性。
+
+正则化：
+- dropout = 0.1-0.3。
+- weight decay = 1e-4。
+- early stopping based on validation NLL。
+- gradient clipping = 1.0。
+
+模型集成：
+- 训练 5 个不同 seed 的模型。
+- 最终预测取混合后验或均值集成。
+- ensemble 方差可作为 epistemic uncertainty。
+
+校准：
+- 在验证集上检查 calibration curve。
+- 使用 NLL、CRPS、prediction interval coverage 作为指标。
+- 例如 90% credible interval 应覆盖约 90% 的真实 rho。
+
+
+6. 训练流程
+
+步骤：
+
+1. 加载 population 数据，提取每个 individual 的 tau、rewards、rho。
+2. 按 group 划分 train/valid/test，避免数据泄漏。
+3. 根据训练集统计量拟合标准化参数，只用训练集计算均值和方差。
+4. 训练模型，优化 Student-t NLL 或 mixture NLL。
+5. 在验证集上监控：
+   - NLL
+   - CRPS
+   - MAE，仅作为辅助解释指标，不作为主损失
+   - credible interval coverage
+   - rank correlation
+6. 使用 early stopping 选择验证集 NLL 最优模型。
+7. 在测试集上报告最终泛化性能。
+
+
+7. 推荐超参数
+
+hidden_dim: 128
+road_encoder_layers: 3
+set_encoder_layers: 2
+attention_heads: 4
+dropout: 0.1
+batch_size: 8-32，视显存和 tau 尺寸而定
+optimizer: AdamW
+learning_rate: 1e-4 到 3e-4
+weight_decay: 1e-4
+max_epochs: 200
+early_stopping_patience: 20
+gradient_clip_norm: 1.0
+likelihood: Student-t
+
+
+8. 为什么这个设计合理
+
+第一，tau 和 rewards 是车辆-道路结构数据，不是时序数据。rho 通常由车辆对道路的距离、排队长度和奖励分布共同决定。Road Transformer 或 Road Graph Encoder 能建模道路之间的相互关系，比直接 flatten 后接 MLP 更容易学到可迁移规律。
+
+第二，N 个 agent/样本构成集合，顺序本身不应影响 rho。Set Transformer 或 DeepSets 提供 permutation-invariant 表示，能减少无意义顺序对模型的干扰。
+
+第三，rho 预测存在不确定性。使用 Student-t NLL 或 mixture NLL 可以学习 p(rho | tau, rewards)，而不是只学习一个点估计。这比 MSE 更符合贝叶斯推断，也能给出可信区间。
+
+第四，统计特征分支提供稳健的全局信息，深层编码器提供复杂车辆-道路交互模式，两者融合能兼顾准确性和泛化性。
+
+第五，使用 group split、数据增强、dropout、weight decay、early stopping 和 calibration 检查，可以显著降低过拟合风险，使模型在没见过的验证集或测试集上保持较高正确性。
+
+
+9. 最终建议
+
+优先实现版本：
+- Road Transformer Encoder，若有 SUMO 路网拓扑则优先 Road Graph Encoder
+- DeepSets 或轻量 Set Transformer
+- 统计特征 MLP 分支
+- Student-t NLL 损失
+- MC Dropout 或 5-model Deep Ensemble
+
+如果测试集表现显示 rho 后验明显多峰，再升级为 Mixture Density Network。这样可以先保证训练稳定和泛化可靠，再逐步增强模型表达能力。
