@@ -12,7 +12,7 @@
 - Student-t NLL 损失。
 - MC Dropout 或 5-model Deep Ensemble。
 
-如果测试集表现显示 ``rho`` 后验明显多峰，再升级为 Mixture Density Network。
+如果测试集表现显示 ``rho`` 的条件预测分布明显多峰，再升级为 Mixture Density Network。
 这样可以先保证训练稳定和泛化可靠，再逐步增强模型表达能力。
 
 推荐超参数

@@ -9,7 +9,7 @@
 1. 车辆-道路局部编码器。
 2. 车辆集合级聚合器。
 3. 全局统计特征分支。
-4. 贝叶斯预测头。
+4. 概率预测头。
 
 输入张量约定如下：
 
@@ -115,8 +115,8 @@ Road Transformer 更容易落地，也能学习道路之间的相互影响。
 - normalization: LayerNorm
 - dropout: 0.1
 
-贝叶斯预测头
-------------
+概率预测头
+----------
 
 基础版本采用 Student-t likelihood head：
 
@@ -136,7 +136,7 @@ Road Transformer 更容易落地，也能学习道路之间的相互影响。
 
 Student-t 对异常 ``rho`` 或高噪声样本更稳健，也比 Gaussian NLL 对离群点更不敏感。
 
-如果 ``rho`` 后验可能明显多峰，可升级为 Mixture Density Network：
+如果 ``rho`` 的条件预测分布可能明显多峰，可升级为 Mixture Density Network：
 
 .. math::
 

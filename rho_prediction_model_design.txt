@@ -2,16 +2,16 @@
 
 1. 任务定义
 
-目标是设计一个从 tau 和奖励矩阵 rewards 中预测 rho 的模型。以 SUMO 环境为例，tau 不是时间序列，而是“车辆-道路”结构特征：每辆车在出现时，对每条道路记录距离终点的距离和该道路的排队长度。rho 不应只被看作一个确定性回归标签，而应被看作条件分布 p(rho | tau, rewards) 的统计量或后验预测结果。因此模型输出的不只是一个点估计 rho_hat，还应输出预测不确定性，例如均值 mu 和尺度 sigma，必要时也可以输出混合分布参数。
+目标是设计一个从 tau 和奖励矩阵 rewards 中预测 rho 的模型。以 SUMO 环境为例，tau 不是时间序列，而是“车辆-道路”结构特征：每辆车在出现时，对每条道路记录距离终点的距离和该道路的排队长度。在本项目的数据生成方向中，tau 和 rewards 通过仿真产生 rho，因此模型学习的是条件预测分布 p(rho | tau, rewards)，而不是严格贝叶斯意义上的后验分布。rho 不应只被看作一个确定性回归标签，而应被看作该条件预测分布的统计量或预测结果。因此模型输出的不只是一个点估计 rho_hat，还应输出预测不确定性，例如均值 mu 和尺度 sigma，必要时也可以输出混合分布参数。
 
 输入：
 - tau: shape 通常为 [N_vehicle, N_road, D_tau]，例如 [1557, 114, 2]。以 SUMO 环境为例，1557 表示车辆数，114 表示道路数，2 个特征为 [距离终点的距离, 该道路的排队长度]。
 - rewards: shape 通常为 [N_vehicle, N_road]，例如 [1557, 114]，表示每辆车对每条道路各自的奖励。
 
 输出：
-- rho 的后验预测分布参数。
+- rho 的条件预测分布参数。
 - 默认输出为 Gaussian 或 Student-t 分布参数：mu, sigma。
-- 最终预测值可取后验均值 E[rho | tau, rewards] = mu，也可以在需要稳健性时取后验中位数。
+- 最终预测值可取条件均值 E[rho | tau, rewards] = mu，也可以在需要稳健性时取条件中位数。
 
 
 2. 数据集划分
@@ -46,7 +46,7 @@
 
 3. 网络架构
 
-整体采用“道路编码器 + 车辆集合聚合 + 全局统计分支 + 贝叶斯预测头”的结构。
+整体采用“道路编码器 + 车辆集合聚合 + 全局统计分支 + 概率预测头”的结构。
 
 输入张量：
 - tau: [B, N_vehicle, N_road, D_tau]
@@ -131,7 +131,7 @@ h = concat(h_global, h_stats)
 - normalization: LayerNorm
 - dropout: 0.1
 
-3.4 贝叶斯预测头
+3.4 概率预测头
 
 基础版本：Student-t likelihood head
 
@@ -151,11 +151,11 @@ rho | tau, rewards ~ StudentT(nu, mu, sigma)
 选择 Student-t 的原因：
 - 对异常 rho 或高噪声样本更稳健。
 - 比 Gaussian NLL 对离群点不那么敏感。
-- 更符合贝叶斯后验预测中存在尾部不确定性的情况。
+- 更适合预测分布中存在尾部不确定性的情况。
 
 增强版本：Mixture Density Network
 
-如果 rho 的后验可能多峰，可输出 K 个 Student-t 或 Gaussian mixture：
+如果 rho 的条件预测分布可能多峰，可输出 K 个 Student-t 或 Gaussian mixture：
 - mixture logits pi_k
 - mu_k
 - sigma_k
@@ -170,7 +170,7 @@ K 可取 3 或 5。数据量较小时先用 K=1，避免过拟合。
 
 4. 损失函数：不用 MSE
 
-由于任务本质是贝叶斯推断，训练目标应最大化条件后验预测概率，而不是最小化点估计误差。
+由于任务本质是条件概率预测，训练目标应最大化真实 rho 在条件预测分布下的概率，而不是最小化点估计误差。
 
 主损失：负对数似然 NLL
 
@@ -196,7 +196,7 @@ L = L_nll + lambda_crps * L_crps
 
 L = E_q[-log p(rho | tau, rewards, w)] + beta * KL(q(w) || p(w))
 
-这相当于变分推断的 ELBO 目标，符合贝叶斯推断设定。
+这相当于变分推断的 ELBO 目标，可作为 Bayesian Neural Network 扩展设定。
 
 辅助损失 3：排序一致性损失
 
@@ -210,7 +210,7 @@ L_total = L_nll + beta * L_kl + lambda_rank * L_rank
 
 默认推荐：
 - 首选 Student-t NLL。
-- 数据量足够且后验多峰时用 mixture NLL。
+- 数据量足够且条件预测分布多峰时用 mixture NLL。
 - 用 MC Dropout 或 Deep Ensemble 估计 epistemic uncertainty。
 
 
@@ -240,7 +240,7 @@ L_total = L_nll + beta * L_kl + lambda_rank * L_rank
 
 模型集成：
 - 训练 5 个不同 seed 的模型。
-- 最终预测取混合后验或均值集成。
+- 最终预测取混合预测分布或均值集成。
 - ensemble 方差可作为 epistemic uncertainty。
 
 校准：
@@ -290,7 +290,7 @@ likelihood: Student-t
 
 第二，N 个 agent/样本构成集合，顺序本身不应影响 rho。Set Transformer 或 DeepSets 提供 permutation-invariant 表示，能减少无意义顺序对模型的干扰。
 
-第三，rho 预测存在不确定性。使用 Student-t NLL 或 mixture NLL 可以学习 p(rho | tau, rewards)，而不是只学习一个点估计。这比 MSE 更符合贝叶斯推断，也能给出可信区间。
+第三，rho 预测存在不确定性。使用 Student-t NLL 或 mixture NLL 可以学习 p(rho | tau, rewards)，而不是只学习一个点估计。这比 MSE 更符合条件概率预测设定，也能给出预测区间。
 
 第四，统计特征分支提供稳健的全局信息，深层编码器提供复杂车辆-道路交互模式，两者融合能兼顾准确性和泛化性。
 
@@ -306,4 +306,4 @@ likelihood: Student-t
 - Student-t NLL 损失
 - MC Dropout 或 5-model Deep Ensemble
 
-如果测试集表现显示 rho 后验明显多峰，再升级为 Mixture Density Network。这样可以先保证训练稳定和泛化可靠，再逐步增强模型表达能力。
+如果测试集表现显示 rho 的条件预测分布明显多峰，再升级为 Mixture Density Network。这样可以先保证训练稳定和泛化可靠，再逐步增强模型表达能力。
