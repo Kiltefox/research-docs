@@ -154,3 +154,12 @@ dmypy.json
 cython_debug/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks
+
+# Local SUMO prediction data and training artifacts
+prediction_model/dataset/*.pkl
+prediction_model/dataset/*.pt
+!prediction_model/dataset/.gitkeep
+prediction_model/checkpoints/
+prediction_model/runs/
+prediction_model/outputs/
+prediction_model/dataset/
