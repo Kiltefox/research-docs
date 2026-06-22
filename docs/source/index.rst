@@ -25,6 +25,7 @@ Rho 预测模型设计文档
    architecture
    training
    implementation
+   history
 
 .. toctree::
    :hidden:
