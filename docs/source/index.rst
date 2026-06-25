@@ -26,6 +26,7 @@ Rho 预测模型设计文档
    training
    implementation
    history
+   dataset_change_analysis
 
 .. toctree::
    :hidden:

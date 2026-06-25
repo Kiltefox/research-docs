@@ -4,8 +4,8 @@ project = "Rho Prediction Model"
 copyright = "2026, Kiltefox"
 author = "Kiltefox"
 
-release = "0.2.0"
-version = "0.2.0"
+release = "0.3.0"
+version = "0.3.0"
 
 extensions = [
     "sphinx.ext.duration",
