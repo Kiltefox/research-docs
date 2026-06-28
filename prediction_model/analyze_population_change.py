@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
@@ -109,6 +110,25 @@ def main() -> None:
         default="auto",
         help="Low-dimensional visualization method. auto writes PCA and t-SNE when sklearn is available.",
     )
+    parser.add_argument(
+        "--no-position-heatmaps",
+        action="store_true",
+        help="Skip car-road position heatmaps for tau0_distance, tau1_queue, reward, and rho.",
+    )
+    parser.add_argument(
+        "--heatmap-value-percentiles",
+        nargs=2,
+        type=float,
+        default=[2.0, 98.0],
+        metavar=("LOW", "HIGH"),
+        help="Percentile limits for initial/final heatmaps. Clipping improves visual contrast.",
+    )
+    parser.add_argument(
+        "--heatmap-delta-percentile",
+        type=float,
+        default=95.0,
+        help="Absolute delta percentile used for symmetric final-initial color limits.",
+    )
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
     args = parser.parse_args()
 
@@ -157,6 +177,17 @@ def main() -> None:
     stats["runtime_seconds"] = round(time.time() - start, 3)
 
     chart_paths = make_charts(initial_rows, final_rows, comparison_rows, output_dir, args.embedding, args.tsne_perplexity)
+    if not args.no_position_heatmaps:
+        chart_paths.extend(
+            make_position_heatmaps(
+                Path(args.initial),
+                Path(args.final),
+                output_dir,
+                args.max_samples,
+                tuple(args.heatmap_value_percentiles),
+                args.heatmap_delta_percentile,
+            )
+        )
     stats["charts"] = [str(path) for path in chart_paths]
 
     with (output_dir / "analysis_report.json").open("w", encoding="utf-8") as f:
@@ -493,6 +524,173 @@ def make_charts(
         if tsne_path is not None:
             paths.append(tsne_path)
     return paths
+
+
+def make_position_heatmaps(
+    initial_path: Path,
+    final_path: Path,
+    output_dir: Path,
+    max_samples: int,
+    value_percentiles: tuple[float, float],
+    delta_percentile: float,
+) -> list[Path]:
+    charts_dir = output_dir / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    print("Computing car-road position heatmaps ...")
+    initial = compute_position_means(initial_path, max_samples)
+    final = compute_position_means(final_path, max_samples)
+    specs = [
+        ("tau0_distance", "tau0_distance", "viridis"),
+        ("tau1_queue", "tau1_queue", "viridis"),
+        ("reward", "reward", "viridis"),
+        ("rho", "rho broadcast to valid car-road positions", "viridis"),
+    ]
+    paths = []
+    for key, title, cmap in specs:
+        path = charts_dir / f"{key}_position_heatmap.png"
+        plot_position_triptych(initial[key], final[key], path, title, cmap, value_percentiles, delta_percentile)
+        paths.append(path)
+    return paths
+
+
+def compute_position_means(pickle_path: Path, max_samples: int) -> dict[str, np.ndarray]:
+    install_pickle_compat()
+    print(f"Loading {pickle_path} for position heatmaps ...")
+    with pickle_path.open("rb") as f:
+        population = pickle.load(f)
+    limit = len(population) if max_samples <= 0 else min(max_samples, len(population))
+    if limit == 0:
+        raise ValueError(f"No individuals available in {pickle_path}")
+
+    first_tau = torch.as_tensor(population[0].tau, dtype=torch.float32).cpu()
+    if first_tau.dim() != 3:
+        raise ValueError(f"First individual tau must be 3-D, got {tuple(first_tau.shape)}")
+    n_vehicle, n_road, tau_dim = (int(v) for v in first_tau.shape)
+
+    sums = {
+        "tau0_distance": np.zeros((n_vehicle, n_road), dtype=np.float64),
+        "tau1_queue": np.zeros((n_vehicle, n_road), dtype=np.float64),
+        "reward": np.zeros((n_vehicle, n_road), dtype=np.float64),
+        "rho": np.zeros((n_vehicle, n_road), dtype=np.float64),
+    }
+    counts = {key: np.zeros((n_vehicle, n_road), dtype=np.float64) for key in sums}
+
+    for idx in range(limit):
+        individual = population[idx]
+        tau = torch.as_tensor(individual.tau, dtype=torch.float32).cpu()
+        rewards = torch.as_tensor(individual.rewards, dtype=torch.float32).cpu()
+        if tau.shape[:2] != (n_vehicle, n_road):
+            raise ValueError(
+                f"Individual {idx} shape {tuple(tau.shape[:2])} does not match first sample {(n_vehicle, n_road)}"
+            )
+        if rewards.shape != tau.shape[:2]:
+            raise ValueError(f"Individual {idx} rewards shape {tuple(rewards.shape)} does not match tau {tuple(tau.shape)}")
+
+        valid = torch.isfinite(rewards) & torch.isfinite(tau).all(dim=-1)
+        valid_np = valid.numpy()
+        add_position_values(sums["tau0_distance"], counts["tau0_distance"], tau[..., 0], valid)
+        if tau_dim > 1:
+            add_position_values(sums["tau1_queue"], counts["tau1_queue"], tau[..., 1], valid)
+        add_position_values(sums["reward"], counts["reward"], rewards, valid)
+        sums["rho"][valid_np] += float(individual.rho)
+        counts["rho"][valid_np] += 1.0
+
+    del population
+    means = {}
+    for key in sums:
+        means[key] = divide_with_nan(sums[key], counts[key])
+    return means
+
+
+def add_position_values(total: np.ndarray, count: np.ndarray, values: torch.Tensor, valid: torch.Tensor) -> None:
+    finite = valid & torch.isfinite(values)
+    finite_np = finite.numpy()
+    values_np = values.numpy()
+    total[finite_np] += values_np[finite_np].astype(np.float64)
+    count[finite_np] += 1.0
+
+
+def divide_with_nan(total: np.ndarray, count: np.ndarray) -> np.ndarray:
+    result = np.full_like(total, np.nan, dtype=np.float64)
+    np.divide(total, count, out=result, where=count > 0)
+    return result
+
+
+def plot_position_triptych(
+    initial: np.ndarray,
+    final: np.ndarray,
+    path: Path,
+    title: str,
+    cmap: str,
+    value_percentiles: tuple[float, float],
+    delta_percentile: float,
+) -> None:
+    delta = final - initial
+    value_vmin, value_vmax = shared_color_limits(initial, final, value_percentiles)
+    delta_abs = symmetric_delta_limit(delta, delta_percentile)
+    value_cmap = masked_cmap(cmap)
+    delta_cmap = masked_cmap("coolwarm")
+    delta_norm = TwoSlopeNorm(vmin=-delta_abs, vcenter=0.0, vmax=delta_abs)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 8), constrained_layout=True)
+    panels = [
+        ("initial", initial, value_cmap, value_vmin, value_vmax, None),
+        ("final", final, value_cmap, value_vmin, value_vmax, None),
+        ("final - initial", delta, delta_cmap, None, None, delta_norm),
+    ]
+    for ax, (panel_title, matrix, panel_cmap, vmin, vmax, norm) in zip(axes, panels, strict=True):
+        image = ax.imshow(
+            matrix,
+            aspect="auto",
+            origin="upper",
+            cmap=panel_cmap,
+            vmin=vmin,
+            vmax=vmax,
+            norm=norm,
+            interpolation="nearest",
+        )
+        ax.set_title(panel_title)
+        ax.set_xlabel("road_index")
+        ax.set_ylabel("car_index")
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(
+        f"{title} position mean heatmap "
+        f"(value p{value_percentiles[0]:g}-p{value_percentiles[1]:g}, delta +/-p{delta_percentile:g})"
+    )
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def shared_color_limits(initial: np.ndarray, final: np.ndarray, percentiles: tuple[float, float]) -> tuple[float, float]:
+    values = np.concatenate([initial[np.isfinite(initial)], final[np.isfinite(final)]])
+    if values.size == 0:
+        return 0.0, 1.0
+    lower, upper = sorted(float(value) for value in percentiles)
+    lo = float(np.nanpercentile(values, lower))
+    hi = float(np.nanpercentile(values, upper))
+    if lo == hi:
+        pad = max(abs(lo) * 1e-6, 1e-9)
+        return lo - pad, hi + pad
+    return lo, hi
+
+
+def symmetric_delta_limit(delta: np.ndarray, percentile: float) -> float:
+    values = np.abs(delta[np.isfinite(delta)])
+    if values.size == 0:
+        return 1.0
+    clipped_percentile = min(max(float(percentile), 0.0), 100.0)
+    limit = float(np.nanpercentile(values, clipped_percentile))
+    if limit <= 0.0:
+        limit = float(np.nanmax(values))
+    if limit <= 0.0:
+        return 1.0
+    return limit
+
+
+def masked_cmap(name: str):
+    cmap = plt.get_cmap(name).copy()
+    cmap.set_bad("#f2f2f2")
+    return cmap
 
 
 def plot_distribution(initial_rows: list[dict[str, Any]], final_rows: list[dict[str, Any]], charts_dir: Path, column: str) -> Path:
