@@ -1,5 +1,5 @@
-Rho 预测模型设计文档
-====================
+学习文档
+========
 
 本文档描述一个从 ``tau`` 与奖励矩阵 ``rewards`` 预测 ``rho`` 的概率模型设计。
 设计目标不是只输出单点回归值，而是学习条件预测分布
@@ -18,13 +18,18 @@ Rho 预测模型设计文档
 
 .. toctree::
    :maxdepth: 2
-   :caption: 模型设计
+   :caption: 代理模型
 
    overview
    data
    architecture
    training
    implementation
+
+.. toctree::
+   :maxdepth: 2
+   :caption: 实验记录
+
    history
    dataset_change_analysis
 

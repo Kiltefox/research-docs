@@ -1,6 +1,6 @@
 """Sphinx configuration for the rho prediction model documentation."""
 
-project = "Rho Prediction Model"
+project = "学习文档"
 copyright = "2026, Kiltefox"
 author = "Kiltefox"
 
@@ -18,7 +18,7 @@ exclude_patterns = []
 language = "zh_CN"
 
 html_theme = "sphinx_rtd_theme"
-html_title = "Rho Prediction Model"
+html_title = "学习文档"
 html_static_path = []
 
 epub_show_urls = "footnote"
