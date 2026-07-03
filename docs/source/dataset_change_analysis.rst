@@ -1,151 +1,257 @@
 数据集变化分析
 ==============
 
-本节对 ``initial_population.pkl`` 与 ``final_population.pkl`` 进行配对分析。每个
-individual 按 ``index`` 一一对应，比较优化前后的 ``rho``、有效数据比例、reward
-统计量以及 ``tau`` 通道统计量变化。
+本页分析 ``prediction_model/dataset/initial_population.pkl`` 到
+``prediction_model/dataset/final_population.pkl`` 的变化。数据由隔壁
+``MASDiff`` 目录中的 SUMO/MASDiff 算法生成；本仓库只做离线分析、图表输出和文档展示。
+
+分析脚本为 ``prediction_model/analyze_population_change.py``。脚本会输出 individual 级 CSV、
+高维降维结果、位置热力图、选择压力诊断和 ``analysis_report.json``。
+
+分析口径
+--------
+
+这批 population 不能简单理解成“第 i 个 initial individual 变成了第 i 个 final individual”。
+根据 ``MASDiff/src/pipeline/runner.py`` 和 ``MASDiff/src/pipeline/steps.py``，迭代阶段会：
+
+1. 用当前 population 训练扩散模型。
+2. 按 ``rho`` 选择 elite。
+3. 对 elite 的 reward 做截断扩散变异。
+4. 重新训练 DQN、重新 SUMO 仿真、重新计算 ``rho``。
+5. 将旧 population 和 mutants 合并，只保留 ``rho`` 最大的 top-M。
+
+因此 ``final_population`` 是选择后的幸存种群，不是严格的逐行后代。文档中的
+``final - initial`` 主要表示分布变化；真正的因果分析应优先依赖 ``parent_rho``、
+``delta_parent_rho`` 等 lineage 信息。
 
 核心结论
 --------
 
-- 共比较 200 对 individual。
-- ``rho`` 均值从 ``0.024489`` 上升到 ``0.025914``，平均增量为 ``0.001424``。
-- ``rho`` 的配对 t 检验 p 值为 ``1.70e-08``，说明整体上升是显著的。
-- 123 个 individual 的 ``rho`` 上升，76 个下降，1 个基本不变。
-- ``reward_mean``、``valid_ratio`` 和 ``tau`` 均值没有表现出同等明显的整体迁移。
-- PCA 图显示 initial 与 final 的 summary feature 分布大量重叠，说明 final population
-  更像是在原分布附近发生局部扰动，而不是整体迁移到新区域。
-- 车-路位置热力图显示，``tau0_distance`` 基本保持不变，``tau1_queue`` 和 ``reward``
-  主要是局部正负波动；``rho`` 的提升更像是 population 级别的整体改善，而不是某个固定
-  car-road 区域单独驱动。
+- 共分析 initial/final 各 ``200`` 个 individual。
+- ``rho`` 均值从 ``0.024489`` 上升到 ``0.025914``，平均提升 ``0.001424``。
+- 若按 ``rho = 1 / (1 + MSE)`` 反推，估计 MSE 均值从 ``40.34`` 下降到 ``37.80``，
+  平均下降 ``2.54``。
+- ``reward_mean`` 只上升 ``0.000319``，``tau0_mean`` 只上升 ``0.0662``，
+  ``tau1_mean`` 下降 ``0.0068``；这些变化远小于 ``rho`` 和估计 MSE 的变化。
+- 完整 ``tau/reward/valid`` 高维张量经过特征哈希降维后再 PCA，前两维解释率只有
+  ``4.31%`` 和 ``3.13%``，initial/final 大量重叠，没有形成清晰新簇。
+- 用原始 ``rho`` 做 ``softmax(temperature * rho)`` 的选择压力很弱：
+  ``temperature=1.5`` 时有效样本比例约 ``0.99999``，几乎等于均匀采样。
+- final 中有 ``65`` 个 individual 带有 ``parent_rho`` 元数据，其中 ``56.9%`` 相对父代为正改进，
+  说明变异确实能产生提升，但信号偏弱。
 
-分析方法
---------
+rho 为什么上升
+--------------
 
-分析时先将每个 population 转换为 individual 级 CSV：每个 individual 一行，记录
-``rho``、有效比例、reward 分布、best reward、top-2 reward gap，以及 ``tau`` 两个通道的均值、
-标准差和分位数。随后按 ``index`` 做 final - initial 的配对差值分析，并输出：
+``MASDiff/src/metrics/sumo_ryl_metric.py`` 中 ``rho`` 默认由完整 SUMO 闭环仿真得到：
 
-- 均值、标准差、中位数、最小值、最大值。
-- 正/负/零变化计数。
-- Pearson initial-final 相关系数。
-- Cohen's dz 配对效应量。
-- 配对 t 检验。
-- 分布图、散点图、差值直方图、箱线图和 PCA 低维可视化。
-- 车-路位置热力图：横轴为 ``road_index``，纵轴为 ``car_index``，每个格子表示该位置在
-  200 个 individual 中的平均值。每张图包含 initial、final 和 ``final - initial`` 三个子图；
-  差值图以 0 为中心，红色表示变大，蓝色表示变小。
+.. math::
 
-rho 分布变化
-------------
+   \rho = \frac{1}{1 + \operatorname{MSE}(Q, simulation\_data)}
 
-``final_population`` 的 ``rho`` 分布整体向右移动，低 ``rho`` 样本减少，中高 ``rho`` 样本增加。
-这是最直接体现 final population 改善的图。
+其中 ``Q`` 是目标排队时序，``simulation_data`` 是 DQN policy 在 SUMO 中运行后得到的全网排队长度。
+因此 ``rho`` 上升的直接含义是：final population 中保留下来的 policy 让仿真排队时序更接近目标。
 
 .. image:: images/rho_distribution.png
    :alt: rho distribution
    :align: center
 
-rho 配对差值
-------------
+反推 MSE 后可以更直观看到目标误差下降：
 
-大部分样本的 ``rho`` 变化集中在 0 附近，但正值区域更厚，右尾更长，说明多数个体有提升，
-且少数样本提升幅度较大。
-
-.. image:: images/rho_delta_histogram.png
-   :alt: rho delta histogram
+.. image:: images/mse_est_inv1p_distribution.png
+   :alt: estimated MSE distribution
    :align: center
 
-rho 初始值与最终值
-------------------
+这个变化主要来自 top-M 选择机制。即使 reward 和 tau 的全局统计没有明显迁移，只要变异候选里有一部分
+真实仿真后的 ``rho`` 更高，最终 population 就会被筛选得更好。
 
-虚线表示 ``final = initial``。图中较多点位于虚线上方，说明 final 的 ``rho`` 通常更高。
-但点云较分散，说明 initial 的个体排序没有稳定延续到 final。
+哪些指标真的变了
+----------------
 
-.. image:: images/rho_initial_vs_final.png
-   :alt: rho initial vs final
+下图展示 final 相对 initial 的标准化均值迁移。最明显的是 ``rho`` 上升和估计 MSE 下降；
+其次是 ``best_reward_mean`` 有一定上升。相比之下，``reward_mean``、``tau`` 均值和高维 L2 范数
+都只是小幅变化。
+
+.. image:: images/distribution_change_bar.png
+   :alt: standardized distribution change
    :align: center
 
-reward 均值分布
----------------
+这说明 final population 并没有把整个数据集推到一个完全不同的统计区域。更准确的解释是：
+MASDiff 在高度重叠的候选分布中，通过真实仿真评估筛掉了一部分低 ``rho`` 个体。
 
-``reward_mean`` 的 initial 与 final 分布高度重叠，说明平均 reward 并没有发生明显整体迁移。
-因此 ``rho`` 的提升不是简单由全局平均 reward 上升解释的。
+为什么 reward 均值几乎不变
+--------------------------
+
+``reward_mean`` 的分布高度重叠：
 
 .. image:: images/reward_mean_distribution.png
    :alt: reward mean distribution
    :align: center
 
-关键指标差值箱线图
+原因有三点。
+
+第一，DQN 训练使用的是 ``rewards[car_idx, action_idx]``，关键不在全局均值，而在候选动作之间的相对排序。
+平均 reward 几乎不变，仍可能因为少量关键位置的 action ranking 改变而影响路径选择。
+
+第二，截断扩散是围绕 elite reward 的局部变异，不是从头生成一个远离原分布的新 reward population。
+所以它天然更像局部搜索，而不是全局分布迁移。
+
+第三，当前 ``MASDiff/src/diffusion/sumo_ryl_diffusion.py`` 中 ``TauDiffusionModel`` 对 ``tau`` 条件先做
+car-road 全局 mean pooling，再广播到道路维度。这会削弱具体 ``car_index``、``road_index`` 位置的条件作用，
+导致 reward 变化更像细碎局部扰动。
+
+高维降维说明了什么
 ------------------
 
-不同指标量纲不同，因此该图主要用于观察每个指标自身是否偏离 0。``tau0_mean`` 的个体波动最大，
-但中位数接近 0；``rho``、``reward_mean``、``valid_ratio`` 等指标的绝对变化量较小。
+新脚本没有只用 37 维 summary feature，而是把完整 ``tau0``、``tau1``、``reward`` 和有效 mask
+组成高维向量，先用确定性 feature hashing 降到 ``128`` 维，再做 PCA。
 
-.. image:: images/selected_delta_boxplot.png
-   :alt: selected metric delta boxplot
+.. image:: images/highdim_pca_population_change.png
+   :alt: high-dimensional PCA population change
    :align: center
 
-PCA 整体结构变化
-----------------
+initial 与 final 仍大量重叠，说明即使看完整高维结构，final 也没有形成一个清楚独立的新簇。
+这支持“选择 + 局部扰动”的解释。
 
-PCA 将多个 summary feature 压缩到二维。蓝点为 initial，橙点为 final，灰线连接同一个
-individual 的初始和最终状态。两类点大量重叠，说明 final population 没有形成清晰独立的新群体；
-灰线方向较分散，说明个体变化方向不统一。
-
-.. image:: images/pca_population_change.png
-   :alt: PCA population change
+.. image:: images/highdim_pca_by_rho.png
+   :alt: high-dimensional PCA colored by rho
    :align: center
 
-车-路位置热力图
-----------------
+按 ``rho`` 着色后也没有出现明显的单调空间分层，说明 ``rho`` 不是某个简单二维方向的函数。
+这也解释了为什么只用全局统计量的 baseline 容易接近常数预测：真正有效的信号可能藏在局部 action ranking
+和 SUMO 闭环时序中。
 
-位置热力图用于观察变化是否集中在特定车辆编号或道路编号上。灰色区域表示该 car-road
-位置没有有效数据，因此不参与平均。initial 和 final 子图使用相同颜色尺度，便于直接比较；
-最后一个子图展示 ``final - initial``，用于突出优化前后的局部差异。
+位置热力图结论
+--------------
 
-tau0_distance 位置变化
-~~~~~~~~~~~~~~~~~~~~~~
+位置热力图的横轴是 ``road_index``，纵轴是 ``car_index``，每个格子表示该 car-road 位置在
+200 个 individual 中的平均值。每张图包含 initial、final 和 ``final - initial`` 三个子图。
 
-``tau0_distance`` 的 initial 和 final 图几乎一致，差值图也基本接近 0。说明距离通道主要由
-道路和车辆的几何关系决定，在这批数据的优化前后没有发生可见的系统性变化。换句话说，
-``rho`` 的提升不太可能来自距离矩阵整体变短或变长。
+``tau0_distance`` 完全不变。这符合算法机制：``tau0`` 主要由路网结构和车辆目的地决定，MASDiff 没有改变路网。
 
 .. image:: images/tau0_distance_position_heatmap.png
    :alt: tau0 distance position heatmap
    :align: center
 
-tau1_queue 位置变化
-~~~~~~~~~~~~~~~~~~~
-
-``tau1_queue`` 的高值呈现明显的道路列结构，说明部分道路在许多车辆位置上都具有更高排队值。
-差值图中红蓝条纹交错，变化集中在有效车辆区域内，但没有表现为所有道路或所有车辆同方向增加。
-这说明队列变化更像是局部重新分布，而不是整体拥堵水平统一上升或下降。
+``tau1_queue`` 有局部红蓝变化，但均值只下降 ``0.00747``，中位数差值为 ``0``。它反映的是车辆首次出现时的
+局部排队快照，不是整段仿真的完整拥堵轨迹。
 
 .. image:: images/tau1_queue_position_heatmap.png
    :alt: tau1 queue position heatmap
    :align: center
 
-reward 位置变化
-~~~~~~~~~~~~~~~
-
-``reward`` 的 initial 与 final 热力图整体结构非常接近，差值图呈现细碎的正负交替。
-这与前面的 ``reward_mean`` 分布结论一致：平均 reward 没有明显整体迁移，位置层面也没有出现
-某一批道路或车辆稳定变好的强信号。
+``reward`` 的差值正负几乎各半，位置均值差值约 ``0.00021``。这说明 reward 没有出现稳定的道路列或车辆段整体抬升。
 
 .. image:: images/reward_position_heatmap.png
    :alt: reward position heatmap
    :align: center
 
-rho 位置映射变化
-~~~~~~~~~~~~~~~~
+有效位置比例几乎不变，说明数据形状和有效覆盖率不是 ``rho`` 提升的主要来源。
 
-``rho`` 原本是 individual 级指标，并不是每个 car-road 位置单独一个值。这里将同一个
-individual 的 ``rho`` 广播到它的有效 car-road 位置后再求平均，因此该图主要用于观察
-``rho`` 提升覆盖了哪些有效区域，而不能直接解释为某个道路位置本身产生了 ``rho``。
-差值图大面积为正，说明 final population 的 ``rho`` 提升在有效位置上普遍可见；同时横向差异较弱，
-说明提升不是由某一个 ``road_index`` 列单独贡献。
+.. image:: images/valid_ratio_position_heatmap.png
+   :alt: valid ratio position heatmap
+   :align: center
 
-.. image:: images/rho_position_heatmap.png
+``rho`` 是 individual 级指标，这里只是广播到有效 car-road 位置再求平均。它只能说明 final 的高 ``rho``
+覆盖了多数有效区域，不能说明某个 road 或 car 位置单独导致了 ``rho`` 提升。
+
+.. image:: images/rho_broadcast_position_heatmap.png
    :alt: rho broadcast position heatmap
    :align: center
+
+选择压力问题
+------------
+
+当前 elite selector 在 ``MASDiff/src/evolution/temperature_selection.py`` 中直接使用：
+
+.. math::
+
+   p_i = \operatorname{softmax}(temperature \cdot \rho_i)
+
+但这批 ``rho`` 的范围只有 ``0.01764`` 到 ``0.03154``。数值太窄会让 softmax 接近均匀采样。
+
+.. image:: images/selection_pressure.png
+   :alt: softmax selection pressure
+   :align: center
+
+诊断结果显示，``temperature=1.5`` 时有效样本比例约 ``0.99999``，top-10 概率质量只有 ``0.0504``，
+几乎等于均匀抽样的 ``0.05``。即使 ``temperature=100``，有效样本比例仍约 ``0.965``。
+
+这解释了为什么 final 有提升但幅度有限：最后的 top-M 保留是有效的，但用于产生 mutants 的 elite 采样并没有强烈偏向好个体。
+
+为什么数据会这样变化
+--------------------
+
+综合 MASDiff 代码和这次分析，数据变化的主要原因是：
+
+1. ``rho`` 是完整 SUMO 闭环指标，reward 只是中间训练信号。
+   reward 均值不变并不代表 policy 行为不变；少量位置的 action ranking 改变就可能影响路径选择。
+
+2. ``tau0`` 是结构变量，基本不应变化。
+   它主要来自路网和目的地，算法没有修改路网，所以 ``tau0_distance`` 不动是合理结果。
+
+3. ``tau1`` 是首次出现时的局部排队快照。
+   它会受策略影响，但不是最终评价所用的完整时序，因此它与 ``rho`` 不会一一对应。
+
+4. 扩散模型的条件注入偏全局。
+   当前 ``tau`` 条件被 mean pooling，弱化了车-路位置级条件，reward 变化自然更分散。
+
+5. elite 采样压力太弱。
+   原始 ``rho`` 范围很窄，softmax 近似均匀；这会削弱“好个体更常被变异”的机制。
+
+6. top-M 保留仍然有效。
+   final 的 ``rho`` 分布右移，说明真实仿真评估 + top-M 筛选确实在起作用，只是生成候选的效率不高。
+
+改进方法
+--------
+
+优先建议从选择尺度、lineage 记录和生成结构三处改。
+
+1. 改 elite 选择分数。
+
+   不建议直接对原始 ``rho`` 做 softmax。可以改为 rank-based selection、z-score 后的 ``rho``、
+   ``-MSE``、``delta_mse`` 或 ``delta_rho``。目标是让 elite 采样真正偏向高质量个体。
+
+2. 明确记录父子关系。
+
+   mutant metadata 中应稳定保存 ``parent_id``、``parent_rho``、``candidate_rho``、
+   ``delta_rho``、``iteration_k`` 和是否进入 final population。后续分析应按 lineage 做父子差值，
+   不再依赖行号对齐。
+
+3. 强化局部条件生成。
+
+   扩散模型不要只对 ``tau`` 做全局 mean pooling。可以保留 ``[car, road]`` 局部条件，加入 car embedding、
+   road embedding、局部 MLP、双轴 attention 或 cross-attention，让每个 reward 位置看到自己的
+   ``distance`` 和 ``queue``。
+
+4. 让 surrogate 预测“变好概率”而不是只预测绝对 ``rho``。
+
+   代理模型应重点学习 ``delta_rho``、``delta_mse`` 或候选排序。评估指标应包括 sign accuracy、
+   top-k precision、Spearman 相关，而不仅是 MSE。
+
+5. 加入 simulation_data 压缩特征。
+
+   ``rho`` 比较的是 ``Q`` 与 ``simulation_data`` 的排队时序。只看初始 ``tau`` 和 reward summary
+   信息不足。建议保存每条路的平均排队、峰值、拥堵持续时间、与 ``Q`` 的分路段误差，或保存
+   PCA/autoencoder embedding。
+
+6. 做 action ranking 诊断。
+
+   比 ``reward_mean`` 更重要的是每辆车候选动作的 top-1/top-2 gap、被选动作 reward、
+   A* 推荐动作 reward、reward 与距离/排队长度的相关性。这些指标更接近 DQN 最终如何选路。
+
+7. 让真实评估和代理筛选协同。
+
+   当代理与真实 ``rho`` 对齐较弱时，应降低代理权重，更多依赖真实 SUMO 评估和 rank-based top-M；
+   当代理诊断稳定后，再用代理预筛掉明显差的候选，以节省仿真成本。
+
+后续实验输出建议
+----------------
+
+下一轮 MASDiff 实验建议额外输出三类表：
+
+- ``candidate_lineage.csv``：记录 parent、candidate、delta、是否进入 top-M。
+- ``candidate_surrogate.csv``：记录代理分数、真实 ``rho``、``delta_rho``、top-k 命中情况。
+- ``simulation_feature.csv``：记录 ``simulation_data`` 相对 ``Q`` 的分路段和时序误差特征。
+
+这样可以把当前的“final 数据集变好了”推进到“哪一种变异真正导致 rho 变好”。
